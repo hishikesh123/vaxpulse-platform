@@ -3,5 +3,6 @@ pandas
 python-dotenv
 fastapi
 uvicorn
-streamlit
+streamlit>=1.23.0
 plotly
+altair>=5
