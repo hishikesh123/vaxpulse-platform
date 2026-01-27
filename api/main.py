@@ -10,6 +10,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+from api.db import get_conn
+
+@app.get("/debug/location_count")
+def debug_location_count():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM location;")
+        n = cur.fetchone()[0]
+        cur.execute("SELECT country_name FROM location ORDER BY country_name;")
+        names = [r[0] for r in cur.fetchall()]
+    return {"location_count": n, "countries": names}
+
 
 @app.get("/countries")
 def get_countries():
