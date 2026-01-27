@@ -1,0 +1,7 @@
+psycopg[binary]
+pandas
+python-dotenv
+fastapi
+uvicorn
+streamlit
+plotly
