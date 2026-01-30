@@ -1,6 +1,13 @@
 import os
-from fastapi import FastAPI, HTTPException
+import csv
+import io
+from datetime import date
+from typing import Optional
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
 from api.db import get_conn
 
 app = FastAPI(title="VaxPulse API")
@@ -11,6 +18,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------
+# External data (optional fallback)
+# -------------------------
+OWID_VAX_CSV_URL = os.getenv(
+    "OWID_VAX_CSV_URL",
+    "https://raw.githubusercontent.com/owid/covid-19-data/master/public/data/vaccinations/vaccinations.csv",
+)
+USE_EXTERNAL_FALLBACK = os.getenv("USE_EXTERNAL_FALLBACK", "true").lower() in ("1", "true", "yes")
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "25"))
+
+# Cache external CSV in-memory for a short time (simple approach)
+_external_cache = {"ts": None, "rows": None}
+
+def _fetch_owid_csv_rows():
+    """
+    Downloads OWID vaccinations.csv and returns list of dict rows.
+    Lightweight in-memory cache.
+    """
+    import time
+    now = time.time()
+    if _external_cache["rows"] is not None and _external_cache["ts"] is not None:
+        # 10 minutes cache
+        if now - _external_cache["ts"] < 600:
+            return _external_cache["rows"]
+
+    r = requests.get(OWID_VAX_CSV_URL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+
+    f = io.StringIO(r.text)
+    reader = csv.DictReader(f)
+    rows = list(reader)
+
+    _external_cache["ts"] = now
+    _external_cache["rows"] = rows
+    return rows
+
 
 # -------------------------
 # Health
@@ -25,6 +69,10 @@ def health():
 # -------------------------
 @app.get("/countries")
 def get_countries():
+    """
+    Prefer DB countries.
+    If DB is empty and fallback enabled, return countries from OWID CSV.
+    """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -34,21 +82,32 @@ def get_countries():
                     WHERE country_name IS NOT NULL
                     ORDER BY country_name;
                 """)
-                return [r[0] for r in cur.fetchall()]
+                rows = [r[0] for r in cur.fetchall()]
+        if rows:
+            return rows
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch countries: {e}")
+        # DB failed; try external if enabled
+        if not USE_EXTERNAL_FALLBACK:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch countries: {e}")
+
+    if USE_EXTERNAL_FALLBACK:
+        try:
+            rows = _fetch_owid_csv_rows()
+            countries = sorted({r["location"] for r in rows if r.get("location")})
+            return countries
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"DB empty/failed and external fetch failed: {e}")
+
+    return []
 
 
 # -------------------------
-# KPI: Monthly Growth (month-end totals + MoM growth)
+# KPI: Monthly Growth (DB)
 # -------------------------
 @app.get("/kpi/monthly-growth/{country}")
 def monthly_growth(country: str):
     """
-    Returns:
-      [{"month": "YYYY-MM-01", "total": <month_end_total>, "growth_rate": <mom_ratio_or_null>}, ...]
-    NOTE: For cumulative totals, we do NOT sum totals across month.
-          We take month-end (MAX within month) as an approximation.
+    Month-end total vaccinations + MoM growth rate (DB-backed).
     """
     try:
         with get_conn() as conn:
@@ -87,31 +146,55 @@ def monthly_growth(country: str):
                 """, (country,))
                 rows = cur.fetchall()
 
-        return [
-            {
-                "month": r[0].isoformat(),
-                "total": int(r[1]),
-                "growth_rate": (float(r[2]) if r[2] is not None else None),
-            }
-            for r in rows
-        ]
+        if rows:
+            return [
+                {"month": r[0].isoformat(), "total": int(r[1]), "growth_rate": (float(r[2]) if r[2] is not None else None)}
+                for r in rows
+            ]
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"monthly_growth failed: {e}")
+        if not USE_EXTERNAL_FALLBACK:
+            raise HTTPException(status_code=500, detail=f"monthly_growth failed: {e}")
+
+    # Optional external fallback for monthly growth
+    if USE_EXTERNAL_FALLBACK:
+        try:
+            rows = _fetch_owid_csv_rows()
+            # Filter rows for country; use date + total_vaccinations field (OWID)
+            crows = [r for r in rows if r.get("location") == country and r.get("date") and r.get("total_vaccinations")]
+            if not crows:
+                return []
+
+            df = pd.DataFrame(crows)
+            df["date"] = pd.to_datetime(df["date"])
+            df["total"] = pd.to_numeric(df["total_vaccinations"], errors="coerce")
+            df = df.dropna(subset=["date", "total"]).sort_values("date")
+            df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
+
+            month_end = df.groupby("month")["total"].max().reset_index()
+            month_end["growth_rate"] = month_end["total"].pct_change()
+
+            return [
+                {"month": d["month"].date().isoformat(), "total": int(d["total"]), "growth_rate": (None if pd.isna(d["growth_rate"]) else float(d["growth_rate"]))}
+                for _, d in month_end.iterrows()
+            ]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"External monthly growth failed: {e}")
+
+    return []
 
 
 # -------------------------
-# KPI: Manufacturer share (latest snapshot)
+# KPI: Manufacturer share (DB only; OWID has separate CSV for manufacturers)
 # -------------------------
 @app.get("/kpi/manufacturer-share/{country}")
 def manufacturer_share(country: str):
     """
-    Returns top manufacturers for the LATEST date available for the country.
-    Avoid summing cumulative totals across multiple dates.
+    Returns top manufacturers for the LATEST date available for the country (DB-backed).
     """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # latest date for the country
                 cur.execute("""
                     SELECT MAX(date::date)
                     FROM Vaccination_by_manu
@@ -139,10 +222,39 @@ def manufacturer_share(country: str):
 
 
 # -------------------------
+# KPI tiles summary for Superset-style top cards
+# -------------------------
+@app.get("/kpi/summary/{country}")
+def kpi_summary(country: str):
+    """
+    Summary KPIs to populate top cards.
+    Uses DB monthly growth; falls back to external if enabled.
+    """
+    series = monthly_growth(country)
+    if not series:
+        return {"country": country, "latest_total": None, "latest_growth_rate": None, "peak_growth_rate": None, "as_of": None}
+
+    latest = series[-1]
+    growth_rates = [r["growth_rate"] for r in series if r.get("growth_rate") is not None]
+    peak = max(growth_rates) if growth_rates else None
+
+    return {
+        "country": country,
+        "latest_total": latest.get("total"),
+        "latest_growth_rate": latest.get("growth_rate"),
+        "peak_growth_rate": peak,
+        "as_of": latest.get("month"),
+    }
+
+
+# -------------------------
 # Meta: last updated
 # -------------------------
 @app.get("/meta/last-updated/{country}")
 def meta_last_updated_country(country: str):
+    """
+    DB last-updated for this country. If DB empty and fallback enabled, infer from OWID.
+    """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -152,9 +264,24 @@ def meta_last_updated_country(country: str):
                     WHERE location = %s;
                 """, (country,))
                 d = cur.fetchone()[0]
-        return {"country": country, "last_updated": d.isoformat() if d else None}
+        if d:
+            return {"country": country, "last_updated": d.isoformat()}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"meta_last_updated_country failed: {e}")
+        if not USE_EXTERNAL_FALLBACK:
+            raise HTTPException(status_code=500, detail=f"meta_last_updated_country failed: {e}")
+
+    if USE_EXTERNAL_FALLBACK:
+        try:
+            rows = _fetch_owid_csv_rows()
+            crows = [r for r in rows if r.get("location") == country and r.get("date")]
+            if not crows:
+                return {"country": country, "last_updated": None}
+            last = max(r["date"] for r in crows)
+            return {"country": country, "last_updated": last}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"External last-updated failed: {e}")
+
+    return {"country": country, "last_updated": None}
 
 
 # -------------------------
@@ -163,15 +290,11 @@ def meta_last_updated_country(country: str):
 @app.get("/quality/summary/{country}")
 def quality_summary(country: str):
     """
-    Lightweight quality summary:
-      - months observed
-      - missing months (based on min/max range)
-      - null rate for total_vaccination
+    DB quality summary. (External quality can be added later if needed.)
     """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Count observed distinct months
                 cur.execute("""
                     SELECT COUNT(DISTINCT date_trunc('month', date::date))
                     FROM Vaccination
@@ -179,7 +302,6 @@ def quality_summary(country: str):
                 """, (country,))
                 observed_months = cur.fetchone()[0] or 0
 
-                # Expected months from min->max
                 cur.execute("""
                     WITH bounds AS (
                       SELECT
@@ -199,7 +321,6 @@ def quality_summary(country: str):
 
                 missing_months = max(expected_months - observed_months, 0)
 
-                # Null rate for total_vaccination
                 cur.execute("""
                     SELECT
                       CASE WHEN COUNT(*) = 0 THEN 0
@@ -218,3 +339,62 @@ def quality_summary(country: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"quality_summary failed: {e}")
+
+
+# -------------------------
+# World map data (country comparison)
+# -------------------------
+@app.get("/map/world")
+def map_world(
+    metric: str = Query(..., description="latest_total_vaccinations | latest_mom_growth_rate"),
+):
+    """
+    Returns: [{"country":"Australia","iso_code":"AUS","value":123}, ...]
+    Uses external OWID for ISO codes if DB lacks them.
+    """
+    # For a map we need ISO3 codes. OWID has iso_code in the CSV.
+    if not USE_EXTERNAL_FALLBACK:
+        raise HTTPException(status_code=400, detail="World map requires external data fallback (OWID CSV) or iso_code in DB.")
+
+    try:
+        rows = _fetch_owid_csv_rows()
+
+        # build latest per country
+        # Keep only valid iso_code (OWID uses iso_code; continents often have OWID_*)
+        filtered = [
+            r for r in rows
+            if r.get("iso_code") and r.get("location") and r.get("date")
+            and not r["iso_code"].startswith("OWID")
+        ]
+
+        df = pd.DataFrame(filtered)
+        df["date"] = pd.to_datetime(df["date"])
+
+        if metric == "latest_total_vaccinations":
+            df["value"] = pd.to_numeric(df.get("total_vaccinations"), errors="coerce")
+            df = df.dropna(subset=["value"])
+            idx = df.groupby("location")["date"].idxmax()
+            latest = df.loc[idx, ["location", "iso_code", "value"]]
+            latest = latest.rename(columns={"location": "country"})
+            return latest.to_dict(orient="records")
+
+        if metric == "latest_mom_growth_rate":
+            # compute month-end growth using totals
+            df["total"] = pd.to_numeric(df.get("total_vaccinations"), errors="coerce")
+            df = df.dropna(subset=["total"])
+            df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
+            month_end = df.groupby(["location", "iso_code", "month"])["total"].max().reset_index()
+            month_end = month_end.sort_values(["location", "month"])
+            month_end["growth_rate"] = month_end.groupby("location")["total"].pct_change()
+            # take latest month per location with non-null growth
+            month_end = month_end.dropna(subset=["growth_rate"])
+            idx = month_end.groupby("location")["month"].idxmax()
+            latest = month_end.loc[idx, ["location", "iso_code", "growth_rate"]]
+            latest = latest.rename(columns={"location": "country", "growth_rate": "value"})
+            return latest.to_dict(orient="records")
+
+        raise HTTPException(status_code=400, detail="Unknown metric")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"map_world failed: {e}")
