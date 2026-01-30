@@ -24,8 +24,23 @@ def debug_location_count():
 
 @app.get("/countries")
 def get_countries():
-    return ["Australia", "India", "USA"]
-
+    """
+    Returns all countries from the database.
+    Assumes a table Location(country_name).
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT country_name
+                    FROM Location
+                    WHERE country_name IS NOT NULL
+                    ORDER BY country_name;
+                """)
+                rows = cur.fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch countries: {e}")
 @app.get("/kpi/monthly-growth/{country}")
 def monthly_growth(country: str):
     return [
