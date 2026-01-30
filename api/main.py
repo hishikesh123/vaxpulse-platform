@@ -3,7 +3,7 @@ import csv
 import io
 from datetime import date
 from typing import Optional
-
+import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -345,56 +345,67 @@ def quality_summary(country: str):
 # World map data (country comparison)
 # -------------------------
 @app.get("/map/world")
-def map_world(
-    metric: str = Query(..., description="latest_total_vaccinations | latest_mom_growth_rate"),
-):
-    """
-    Returns: [{"country":"Australia","iso_code":"AUS","value":123}, ...]
-    Uses external OWID for ISO codes if DB lacks them.
-    """
-    # For a map we need ISO3 codes. OWID has iso_code in the CSV.
+def map_world(metric: str = Query(..., description="latest_total_vaccinations | latest_mom_growth_rate")):
     if not USE_EXTERNAL_FALLBACK:
-        raise HTTPException(status_code=400, detail="World map requires external data fallback (OWID CSV) or iso_code in DB.")
+        raise HTTPException(status_code=400, detail="Enable USE_EXTERNAL_FALLBACK=true for world map.")
 
     try:
         rows = _fetch_owid_csv_rows()
+        if not rows:
+            raise HTTPException(status_code=500, detail="OWID CSV returned 0 rows")
 
-        # build latest per country
-        # Keep only valid iso_code (OWID uses iso_code; continents often have OWID_*)
-        filtered = [
-            r for r in rows
-            if r.get("iso_code") and r.get("location") and r.get("date")
-            and not r["iso_code"].startswith("OWID")
-        ]
+        df = pd.DataFrame(rows)
 
-        df = pd.DataFrame(filtered)
-        df["date"] = pd.to_datetime(df["date"])
+        required_base = {"iso_code", "location", "date"}
+        missing = required_base - set(df.columns)
+        if missing:
+            raise HTTPException(status_code=500, detail=f"OWID CSV missing columns: {sorted(missing)}")
+
+        # Filter to countries only
+        df = df[df["iso_code"].notna() & df["location"].notna() & df["date"].notna()]
+        df = df[~df["iso_code"].str.startswith("OWID", na=False)]
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
 
         if metric == "latest_total_vaccinations":
-            df["value"] = pd.to_numeric(df.get("total_vaccinations"), errors="coerce")
-            df = df.dropna(subset=["value"])
+            if "total_vaccinations" not in df.columns:
+                raise HTTPException(status_code=500, detail="OWID CSV missing total_vaccinations column")
+
+            df["total_vaccinations"] = pd.to_numeric(df["total_vaccinations"], errors="coerce")
+            df = df.dropna(subset=["total_vaccinations"])
+
             idx = df.groupby("location")["date"].idxmax()
-            latest = df.loc[idx, ["location", "iso_code", "value"]]
-            latest = latest.rename(columns={"location": "country"})
+            latest = df.loc[idx, ["location", "iso_code", "total_vaccinations"]].copy()
+            latest = latest.rename(columns={"location": "country", "total_vaccinations": "value"})
             return latest.to_dict(orient="records")
 
-        if metric == "latest_mom_growth_rate":
-            # compute month-end growth using totals
-            df["total"] = pd.to_numeric(df.get("total_vaccinations"), errors="coerce")
-            df = df.dropna(subset=["total"])
+        elif metric == "latest_mom_growth_rate":
+            if "total_vaccinations" not in df.columns:
+                raise HTTPException(status_code=500, detail="OWID CSV missing total_vaccinations column")
+
+            df["total_vaccinations"] = pd.to_numeric(df["total_vaccinations"], errors="coerce")
+            df = df.dropna(subset=["total_vaccinations"])
+
             df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
-            month_end = df.groupby(["location", "iso_code", "month"])["total"].max().reset_index()
+            month_end = df.groupby(["location", "iso_code", "month"])["total_vaccinations"].max().reset_index()
             month_end = month_end.sort_values(["location", "month"])
-            month_end["growth_rate"] = month_end.groupby("location")["total"].pct_change()
-            # take latest month per location with non-null growth
+            month_end["growth_rate"] = month_end.groupby("location")["total_vaccinations"].pct_change()
             month_end = month_end.dropna(subset=["growth_rate"])
+
+            if month_end.empty:
+                return []
+
             idx = month_end.groupby("location")["month"].idxmax()
-            latest = month_end.loc[idx, ["location", "iso_code", "growth_rate"]]
+            latest = month_end.loc[idx, ["location", "iso_code", "growth_rate"]].copy()
             latest = latest.rename(columns={"location": "country", "growth_rate": "value"})
             return latest.to_dict(orient="records")
 
-        raise HTTPException(status_code=400, detail="Unknown metric")
+        else:
+            raise HTTPException(status_code=400, detail="Unknown metric")
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"map_world failed: {e}")
+        # This makes the Render logs + client error clearer
+        raise HTTPException(status_code=500, detail=f"map_world crashed: {type(e).__name__}: {e}")
