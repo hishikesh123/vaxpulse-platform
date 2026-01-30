@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from urllib.parse import quote
 
 API = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
 
@@ -184,5 +185,23 @@ with tabs[3]:
 # ---------------- Tab 5: Data Quality ----------------
 with tabs[4]:
     st.subheader("Data Quality")
-    st.caption("Show missing months, null rates, ingestion timestamp, etc.")
-    st.write("Add `/quality/summary/{country}` to power this tab.")
+    st.caption("Missing months, null rates, and freshness indicators.")
+
+    try:
+        q = _get_json(f"/quality/summary/{quote(country)}")
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Country", q.get("country", country))
+        c2.metric("Months", q.get("months", "—"))
+        c3.metric("Missing months", q.get("missing_months", "—"))
+
+        null_rate = q.get("null_rate_total")
+        c4.metric(
+            "Null rate (total)",
+            f"{null_rate*100:.2f}%" if isinstance(null_rate, (int, float)) else "—"
+        )
+
+        st.json(q)  # optional: remove later
+    except Exception as e:
+        st.error(f"Quality endpoint failed for {country}: {e}")
+        st.info("Check API_URL in Streamlit env vars and ensure the endpoint exists.")
